@@ -2949,6 +2949,53 @@ local function updateHiddenSizeVector()
     )
 end
 
+local function clampPositionToBounds(position, frameSize)
+    local rootSize = rootFrame.AbsoluteSize
+    if rootSize.X <= 0 or rootSize.Y <= 0 then
+        return position
+    end
+    if frameSize.X <= 0 or frameSize.Y <= 0 then
+        return position
+    end
+
+    local anchor = mainFrame.AnchorPoint
+    local scaleX, scaleY = position.X.Scale, position.Y.Scale
+
+    local function clampAxis(offset, size, anchorComponent, rootExtent, scaleComponent)
+        local minOffset = size * anchorComponent - rootExtent * scaleComponent
+        local maxOffset = rootExtent - size * (1 - anchorComponent) - rootExtent * scaleComponent
+        if minOffset > maxOffset then
+            local middle = (minOffset + maxOffset) * 0.5
+            return middle
+        end
+        return math.clamp(offset, minOffset, maxOffset)
+    end
+
+    local clampedOffsetX = clampAxis(position.X.Offset, frameSize.X, anchor.X, rootSize.X, scaleX)
+    local clampedOffsetY = clampAxis(position.Y.Offset, frameSize.Y, anchor.Y, rootSize.Y, scaleY)
+
+    if clampedOffsetX ~= position.X.Offset or clampedOffsetY ~= position.Y.Offset then
+        return UDim2.new(scaleX, clampedOffsetX, scaleY, clampedOffsetY)
+    end
+
+    return position
+end
+
+local function ensureFrameInBounds()
+    if not mainFrame or not mainFrame.Parent then
+        return
+    end
+    local frameSize = mainFrame.AbsoluteSize
+    if frameSize.X <= 0 or frameSize.Y <= 0 then
+        return
+    end
+    local current = mainFrame.Position
+    local clamped = clampPositionToBounds(current, frameSize)
+    if clamped.X.Offset ~= current.X.Offset or clamped.Y.Offset ~= current.Y.Offset then
+        mainFrame.Position = clamped
+    end
+end
+
 local function getFinalSize()
     return UDim2.fromOffset(finalSizeVector.X, finalSizeVector.Y)
 end
@@ -2968,12 +3015,25 @@ local function setFinalSize(newSize)
     else
         mainFrame.Size = getHiddenSize()
     end
+    ensureFrameInBounds()
     if indicator.Visible and tabButtons[activeTab] then
         setIndicator(tabButtons[activeTab])
     end
 end
 
 updateHiddenSizeVector()
+
+rootFrame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    task.defer(function()
+        if not mainFrame or not mainFrame.Parent then
+            return
+        end
+        ensureFrameInBounds()
+        if indicator.Visible and tabButtons[activeTab] then
+            setIndicator(tabButtons[activeTab])
+        end
+    end)
+end)
 
 local function applyTabTransparencies(instant)
     for _, button in ipairs(tabButtons) do
@@ -3025,6 +3085,8 @@ local function showMenu(instant)
         TweenService:Create(subtitle, fadeTweenInfo, {TextTransparency = finalSubtitleTransparency}):Play()
         applyTabTransparencies(false)
     end
+
+    ensureFrameInBounds()
 
     task.delay(0.05, function()
         if not mainFrame or not mainFrame.Parent then
@@ -3079,12 +3141,17 @@ local startPos
 
 local function updateDrag(input)
     local delta = input.Position - dragStart
-    mainFrame.Position = UDim2.new(
+    local newPosition = UDim2.new(
         startPos.X.Scale,
         startPos.X.Offset + delta.X,
         startPos.Y.Scale,
         startPos.Y.Offset + delta.Y
     )
+    local frameSize = mainFrame.AbsoluteSize
+    if frameSize.X > 0 and frameSize.Y > 0 then
+        newPosition = clampPositionToBounds(newPosition, frameSize)
+    end
+    mainFrame.Position = newPosition
 end
 
 header.InputBegan:Connect(function(input)
@@ -3141,13 +3208,19 @@ local function updateResize(input)
     setFinalSize(newSize)
     if resizeStartUDim then
         local effectiveDelta = Vector2.new(finalSizeVector.X - resizeStartSize.X, finalSizeVector.Y - resizeStartSize.Y)
-        mainFrame.Position = UDim2.new(
+        local desiredPosition = UDim2.new(
             resizeStartUDim.X.Scale,
             resizeStartUDim.X.Offset + (effectiveDelta.X / 2),
             resizeStartUDim.Y.Scale,
             resizeStartUDim.Y.Offset + (effectiveDelta.Y / 2)
         )
+        local frameSize = mainFrame.AbsoluteSize
+        if frameSize.X > 0 and frameSize.Y > 0 then
+            desiredPosition = clampPositionToBounds(desiredPosition, frameSize)
+        end
+        mainFrame.Position = desiredPosition
     end
+    ensureFrameInBounds()
 end
 
 resizeHandle.InputBegan:Connect(function(input)
@@ -3202,6 +3275,7 @@ local function endInteraction()
             ImageColor3 = style.textDim
         }):Play()
     end
+    ensureFrameInBounds()
 end
 
 UserInputService.InputEnded:Connect(function(input)
