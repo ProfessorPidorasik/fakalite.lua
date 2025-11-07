@@ -1236,6 +1236,7 @@ end
 -- Silent aim -----------------------------------------------------------------
 
 local VirtualUser = game:GetService("VirtualUser")
+local virtualUserCaptured = false
 
 local targetInfo = {
     part = nil,
@@ -1308,6 +1309,11 @@ local function simulateClick(positionOverride, cameraCFrame)
     end
 
     if VirtualUser then
+        if not virtualUserCaptured then
+            virtualUserCaptured = pcall(function()
+                VirtualUser:CaptureController()
+            end) and true or virtualUserCaptured
+        end
         local ok = pcall(function()
             VirtualUser:ClickButton1(viewportPosition, cameraFrame)
         end)
@@ -1317,6 +1323,180 @@ local function simulateClick(positionOverride, cameraCFrame)
     end
 
     return false
+end
+
+local function packArgs(...)
+    return { n = select("#", ...), ... }
+end
+
+local function unpackArgs(values)
+    return table.unpack(values, 1, values.n or #values)
+end
+
+local function cloneArgs(values)
+    local count = values.n or #values
+    local clone = { n = count }
+    for index = 1, count do
+        clone[index] = values[index]
+    end
+    return clone
+end
+
+local function isWorldRoot(instance)
+    return instance == Workspace or (typeof(instance) == "Instance" and instance:IsA("WorldRoot"))
+end
+
+local function computeRedirectedDirection(origin, direction)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then
+        return nil
+    end
+    local toTarget = targetInfo.position - origin
+    local distance = toTarget.Magnitude
+    if distance < 1e-3 then
+        return nil
+    end
+    local magnitude = direction.Magnitude
+    if magnitude <= 0 then
+        magnitude = distance
+    end
+    if magnitude <= 0 then
+        return nil
+    end
+    return toTarget.Unit * magnitude
+end
+
+local function computeCameraRayOverride(instance, method)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+    if not Camera or not (instance == Camera or (typeof(instance) == "Instance" and instance:IsA("Camera"))) then
+        return nil
+    end
+    if method ~= "ScreenPointToRay" and method ~= "ViewportPointToRay" then
+        return nil
+    end
+    local origin = Camera.CFrame.Position
+    local toTarget = targetInfo.position - origin
+    if toTarget.Magnitude < 1e-3 then
+        return nil
+    end
+    return Ray.new(origin, toTarget.Unit)
+end
+
+local function adjustNamecallArguments(self, method, args)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+
+    if method == "ScreenPointToRay" or method == "ViewportPointToRay" then
+        local overrideRay = computeCameraRayOverride(self, method)
+        if overrideRay then
+            return true, overrideRay
+        end
+        return nil
+    end
+
+    if not isWorldRoot(self) then
+        return nil
+    end
+
+    if method == "Raycast" then
+        local origin = args[1]
+        local direction = args[2]
+        local redirected = computeRedirectedDirection(origin, direction)
+        if redirected then
+            local newArgs = cloneArgs(args)
+            newArgs[2] = redirected
+            return false, newArgs
+        end
+    elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" or method == "FindPartOnRay" then
+        local ray = args[1]
+        if typeof(ray) == "Ray" then
+            local redirected = computeRedirectedDirection(ray.Origin, ray.Direction)
+            if redirected then
+                local newArgs = cloneArgs(args)
+                newArgs[1] = Ray.new(ray.Origin, redirected)
+                return false, newArgs
+            end
+        end
+    end
+
+    return nil
+end
+
+local namecallHooked = false
+
+local function hookNamecall()
+    if namecallHooked then
+        return
+    end
+
+    if hookmetamethod and getnamecallmethod then
+        local original
+        local function newNamecall(self, ...)
+            local method = getnamecallmethod()
+            local packed = packArgs(...)
+            local decision, payload = adjustNamecallArguments(self, method, packed)
+            if decision ~= nil then
+                if decision then
+                    return payload
+                elseif payload then
+                    return original(self, unpackArgs(payload))
+                end
+            end
+            return original(self, unpackArgs(packed))
+        end
+
+        local ok, old = pcall(hookmetamethod, game, "__namecall", newNamecall)
+        if ok and old then
+            original = old
+            namecallHooked = true
+            return
+        end
+    end
+
+    if getrawmetatable and getnamecallmethod then
+        local success, mt = pcall(getrawmetatable, game)
+        if not success or not mt then
+            return
+        end
+        local original = mt.__namecall
+        if type(original) ~= "function" then
+            return
+        end
+        local writable = true
+        if setreadonly then
+            writable = pcall(setreadonly, mt, false)
+        end
+        if not writable then
+            return
+        end
+
+        local function newNamecall(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            local packed = packArgs(...)
+            local decision, payload = adjustNamecallArguments(self, method, packed)
+            if decision ~= nil then
+                if decision then
+                    return payload
+                elseif payload then
+                    return original(self, unpackArgs(payload))
+                end
+            end
+            return original(self, unpackArgs(packed))
+        end
+        if newcclosure then
+            newNamecall = newcclosure(newNamecall)
+        end
+        mt.__namecall = newNamecall
+        if setreadonly then
+            pcall(setreadonly, mt, true)
+        end
+        namecallHooked = true
+    end
 end
 
 local function hookMouse()
@@ -1487,6 +1667,7 @@ registerBinding("rage.silentAim", function(value)
             silentAimConnection = RunService.RenderStepped:Connect(updateSilentAim)
         end
         hookMouse()
+        hookNamecall()
     else
         if silentAimConnection then
             silentAimConnection:Disconnect()
@@ -1611,19 +1792,6 @@ end)
 
 registerBinding("rage.antiAimJitter", function(value)
     antiAimJitter = math.clamp(value or 0, 0, 90)
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    if antiAimEnabled then
-        task.delay(0.2, applyAntiAim)
-    end
-    if speedEnabled then
-        storedWalkSpeed = nil
-        task.defer(updateMovementFeatures)
-    end
-    if noclipEnabled then
-        task.defer(updateMovementFeatures)
-    end
 end)
 
 -- Desync ---------------------------------------------------------------------
@@ -2590,6 +2758,19 @@ LocalPlayer.CharacterRemoving:Connect(function()
     end
     if speedEnabled then
         storedWalkSpeed = nil
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if antiAimEnabled then
+        task.delay(0.2, applyAntiAim)
+    end
+    if speedEnabled then
+        storedWalkSpeed = nil
+        task.defer(updateMovementFeatures)
+    end
+    if noclipEnabled then
+        task.defer(updateMovementFeatures)
     end
 end)
 
