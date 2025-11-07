@@ -60,6 +60,20 @@ local style = {
     buttonActive = Color3.fromRGB(60, 20, 70),
 }
 
+local function createInstance(className, properties)
+    local instance = Instance.new(className)
+    for property, value in pairs(properties) do
+        if property == "Children" then
+            for _, child in ipairs(value) do
+                child.Parent = instance
+            end
+        else
+            instance[property] = value
+        end
+    end
+    return instance
+end
+
 local finalTitleTransparency = 0.15
 local finalSubtitleTransparency = 0.4
 local containerFinalTransparency = 0.15
@@ -1222,6 +1236,7 @@ end
 -- Silent aim -----------------------------------------------------------------
 
 local VirtualUser = game:GetService("VirtualUser")
+local virtualUserCaptured = false
 
 local targetInfo = {
     part = nil,
@@ -1294,6 +1309,11 @@ local function simulateClick(positionOverride, cameraCFrame)
     end
 
     if VirtualUser then
+        if not virtualUserCaptured then
+            virtualUserCaptured = pcall(function()
+                VirtualUser:CaptureController()
+            end) and true or virtualUserCaptured
+        end
         local ok = pcall(function()
             VirtualUser:ClickButton1(viewportPosition, cameraFrame)
         end)
@@ -1303,6 +1323,180 @@ local function simulateClick(positionOverride, cameraCFrame)
     end
 
     return false
+end
+
+local function packArgs(...)
+    return { n = select("#", ...), ... }
+end
+
+local function unpackArgs(values)
+    return table.unpack(values, 1, values.n or #values)
+end
+
+local function cloneArgs(values)
+    local count = values.n or #values
+    local clone = { n = count }
+    for index = 1, count do
+        clone[index] = values[index]
+    end
+    return clone
+end
+
+local function isWorldRoot(instance)
+    return instance == Workspace or (typeof(instance) == "Instance" and instance:IsA("WorldRoot"))
+end
+
+local function computeRedirectedDirection(origin, direction)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then
+        return nil
+    end
+    local toTarget = targetInfo.position - origin
+    local distance = toTarget.Magnitude
+    if distance < 1e-3 then
+        return nil
+    end
+    local magnitude = direction.Magnitude
+    if magnitude <= 0 then
+        magnitude = distance
+    end
+    if magnitude <= 0 then
+        return nil
+    end
+    return toTarget.Unit * magnitude
+end
+
+local function computeCameraRayOverride(instance, method)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+    if not Camera or not (instance == Camera or (typeof(instance) == "Instance" and instance:IsA("Camera"))) then
+        return nil
+    end
+    if method ~= "ScreenPointToRay" and method ~= "ViewportPointToRay" then
+        return nil
+    end
+    local origin = Camera.CFrame.Position
+    local toTarget = targetInfo.position - origin
+    if toTarget.Magnitude < 1e-3 then
+        return nil
+    end
+    return Ray.new(origin, toTarget.Unit)
+end
+
+local function adjustNamecallArguments(self, method, args)
+    if not (silentAimEnabled and targetInfo.part and targetInfo.position) then
+        return nil
+    end
+
+    if method == "ScreenPointToRay" or method == "ViewportPointToRay" then
+        local overrideRay = computeCameraRayOverride(self, method)
+        if overrideRay then
+            return true, overrideRay
+        end
+        return nil
+    end
+
+    if not isWorldRoot(self) then
+        return nil
+    end
+
+    if method == "Raycast" then
+        local origin = args[1]
+        local direction = args[2]
+        local redirected = computeRedirectedDirection(origin, direction)
+        if redirected then
+            local newArgs = cloneArgs(args)
+            newArgs[2] = redirected
+            return false, newArgs
+        end
+    elseif method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist" or method == "FindPartOnRay" then
+        local ray = args[1]
+        if typeof(ray) == "Ray" then
+            local redirected = computeRedirectedDirection(ray.Origin, ray.Direction)
+            if redirected then
+                local newArgs = cloneArgs(args)
+                newArgs[1] = Ray.new(ray.Origin, redirected)
+                return false, newArgs
+            end
+        end
+    end
+
+    return nil
+end
+
+local namecallHooked = false
+
+local function hookNamecall()
+    if namecallHooked then
+        return
+    end
+
+    if hookmetamethod and getnamecallmethod then
+        local original
+        local function newNamecall(self, ...)
+            local method = getnamecallmethod()
+            local packed = packArgs(...)
+            local decision, payload = adjustNamecallArguments(self, method, packed)
+            if decision ~= nil then
+                if decision then
+                    return payload
+                elseif payload then
+                    return original(self, unpackArgs(payload))
+                end
+            end
+            return original(self, unpackArgs(packed))
+        end
+
+        local ok, old = pcall(hookmetamethod, game, "__namecall", newNamecall)
+        if ok and old then
+            original = old
+            namecallHooked = true
+            return
+        end
+    end
+
+    if getrawmetatable and getnamecallmethod then
+        local success, mt = pcall(getrawmetatable, game)
+        if not success or not mt then
+            return
+        end
+        local original = mt.__namecall
+        if type(original) ~= "function" then
+            return
+        end
+        local writable = true
+        if setreadonly then
+            writable = pcall(setreadonly, mt, false)
+        end
+        if not writable then
+            return
+        end
+
+        local function newNamecall(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            local packed = packArgs(...)
+            local decision, payload = adjustNamecallArguments(self, method, packed)
+            if decision ~= nil then
+                if decision then
+                    return payload
+                elseif payload then
+                    return original(self, unpackArgs(payload))
+                end
+            end
+            return original(self, unpackArgs(packed))
+        end
+        if newcclosure then
+            newNamecall = newcclosure(newNamecall)
+        end
+        mt.__namecall = newNamecall
+        if setreadonly then
+            pcall(setreadonly, mt, true)
+        end
+        namecallHooked = true
+    end
 end
 
 local function hookMouse()
@@ -1473,6 +1667,7 @@ registerBinding("rage.silentAim", function(value)
             silentAimConnection = RunService.RenderStepped:Connect(updateSilentAim)
         end
         hookMouse()
+        hookNamecall()
     else
         if silentAimConnection then
             silentAimConnection:Disconnect()
@@ -1597,19 +1792,6 @@ end)
 
 registerBinding("rage.antiAimJitter", function(value)
     antiAimJitter = math.clamp(value or 0, 0, 90)
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    if antiAimEnabled then
-        task.delay(0.2, applyAntiAim)
-    end
-    if speedEnabled then
-        storedWalkSpeed = nil
-        task.defer(updateMovementFeatures)
-    end
-    if noclipEnabled then
-        task.defer(updateMovementFeatures)
-    end
 end)
 
 -- Desync ---------------------------------------------------------------------
@@ -2579,6 +2761,19 @@ LocalPlayer.CharacterRemoving:Connect(function()
     end
 end)
 
+LocalPlayer.CharacterAdded:Connect(function()
+    if antiAimEnabled then
+        task.delay(0.2, applyAntiAim)
+    end
+    if speedEnabled then
+        storedWalkSpeed = nil
+        task.defer(updateMovementFeatures)
+    end
+    if noclipEnabled then
+        task.defer(updateMovementFeatures)
+    end
+end)
+
 local function createPage(tabId)
     local page = Instance.new("ScrollingFrame")
     page.Name = "Page"
@@ -3019,124 +3214,137 @@ UserInputService.TouchEnded:Connect(function()
     endInteraction()
 end)
 
--- Loading overlay
-local loadingOverlay = Instance.new("Frame")
-loadingOverlay.Name = "Loading"
-loadingOverlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-loadingOverlay.BackgroundTransparency = 0.4
-loadingOverlay.Size = UDim2.fromScale(1, 1)
-loadingOverlay.Parent = rootFrame
+local loadingUI = {}
 
-local loadingContainer = Instance.new("Frame")
-loadingContainer.Name = "LoadingContainer"
-loadingContainer.AnchorPoint = Vector2.new(0.5, 0.5)
-loadingContainer.Position = UDim2.fromScale(0.5, 0.5)
-loadingContainer.Size = UDim2.fromOffset(260, 120)
-loadingContainer.BackgroundColor3 = style.panelContrast
-loadingContainer.BackgroundTransparency = 0.05
-loadingContainer.Parent = loadingOverlay
-
-local loadingCorner = Instance.new("UICorner")
-loadingCorner.CornerRadius = UDim.new(0, 8)
-loadingCorner.Parent = loadingContainer
-
-local loadingGradient = Instance.new("UIGradient")
-loadingGradient.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, style.panelContrast),
-    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(40, 12, 58)),
-    ColorSequenceKeypoint.new(1, style.panelContrast)
+loadingUI.overlay = createInstance("Frame", {
+    Name = "Loading",
+    BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+    BackgroundTransparency = 0.4,
+    Size = UDim2.fromScale(1, 1),
+    Parent = rootFrame,
 })
-loadingGradient.Rotation = -45
-loadingGradient.Parent = loadingContainer
 
-local loadingStroke = Instance.new("UIStroke")
-loadingStroke.Color = style.stroke
-loadingStroke.Thickness = 1
-loadingStroke.Parent = loadingContainer
+loadingUI.container = createInstance("Frame", {
+    Name = "LoadingContainer",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(260, 120),
+    BackgroundColor3 = style.panelContrast,
+    BackgroundTransparency = 0.05,
+    Parent = loadingUI.overlay,
+})
 
-local loadingLabel = Instance.new("TextLabel")
-loadingLabel.BackgroundTransparency = 1
-loadingLabel.Size = UDim2.new(1, -40, 0, 24)
-loadingLabel.Position = UDim2.new(0, 20, 0, 20)
-loadingLabel.TextXAlignment = Enum.TextXAlignment.Left
-loadingLabel.Font = Enum.Font.GothamSemibold
-loadingLabel.TextSize = 16
-loadingLabel.TextColor3 = style.textBright
-loadingLabel.Text = "loading menu"
-loadingLabel.Parent = loadingContainer
+createInstance("UICorner", {
+    CornerRadius = UDim.new(0, 8),
+    Parent = loadingUI.container,
+})
 
-local progressOuter = Instance.new("Frame")
-progressOuter.Name = "ProgressOuter"
-progressOuter.BackgroundColor3 = style.buttonIdle
-progressOuter.BorderSizePixel = 0
-progressOuter.Position = UDim2.new(0, 20, 0, 70)
-progressOuter.Size = UDim2.new(1, -40, 0, 8)
-progressOuter.Parent = loadingContainer
+createInstance("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, style.panelContrast),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(40, 12, 58)),
+        ColorSequenceKeypoint.new(1, style.panelContrast),
+    }),
+    Rotation = -45,
+    Parent = loadingUI.container,
+})
 
-local progressCorner = Instance.new("UICorner")
-progressCorner.CornerRadius = UDim.new(1, 0)
-progressCorner.Parent = progressOuter
+loadingUI.stroke = createInstance("UIStroke", {
+    Color = style.stroke,
+    Thickness = 1,
+    Parent = loadingUI.container,
+})
 
-local progressStroke = Instance.new("UIStroke")
-progressStroke.Color = style.stroke
-progressStroke.Thickness = 1
-progressStroke.Parent = progressOuter
+loadingUI.label = createInstance("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, -40, 0, 24),
+    Position = UDim2.new(0, 20, 0, 20),
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamSemibold,
+    TextSize = 16,
+    TextColor3 = style.textBright,
+    Text = "loading menu",
+    Parent = loadingUI.container,
+})
 
-local progressFill = Instance.new("Frame")
-progressFill.Name = "ProgressFill"
-progressFill.BackgroundColor3 = style.accent
-progressFill.BorderSizePixel = 0
-progressFill.Size = UDim2.new(0, 0, 1, 0)
-progressFill.Parent = progressOuter
+loadingUI.progressOuter = createInstance("Frame", {
+    Name = "ProgressOuter",
+    BackgroundColor3 = style.buttonIdle,
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 20, 0, 70),
+    Size = UDim2.new(1, -40, 0, 8),
+    Parent = loadingUI.container,
+})
 
-local progressFillCorner = Instance.new("UICorner")
-progressFillCorner.CornerRadius = UDim.new(1, 0)
-progressFillCorner.Parent = progressFill
+createInstance("UICorner", {
+    CornerRadius = UDim.new(1, 0),
+    Parent = loadingUI.progressOuter,
+})
 
-local spinner = Instance.new("ImageLabel")
-spinner.Name = "Spinner"
-spinner.BackgroundTransparency = 1
-spinner.AnchorPoint = Vector2.new(1, 0)
-spinner.Position = UDim2.new(1, 0, 0, 18)
-spinner.Size = UDim2.fromOffset(18, 18)
-spinner.Image = "rbxassetid://11255175019"
-spinner.ImageColor3 = style.accentAlt
-spinner.Parent = loadingLabel
+loadingUI.progressStroke = createInstance("UIStroke", {
+    Color = style.stroke,
+    Thickness = 1,
+    Parent = loadingUI.progressOuter,
+})
 
-local progressTween = TweenService:Create(progressFill, TweenInfo.new(1.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+loadingUI.progressFill = createInstance("Frame", {
+    Name = "ProgressFill",
+    BackgroundColor3 = style.accent,
+    BorderSizePixel = 0,
+    Size = UDim2.new(0, 0, 1, 0),
+    Parent = loadingUI.progressOuter,
+})
+
+createInstance("UICorner", {
+    CornerRadius = UDim.new(1, 0),
+    Parent = loadingUI.progressFill,
+})
+
+loadingUI.spinner = createInstance("ImageLabel", {
+    Name = "Spinner",
+    BackgroundTransparency = 1,
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, 0, 0, 18),
+    Size = UDim2.fromOffset(18, 18),
+    Image = "rbxassetid://11255175019",
+    ImageColor3 = style.accentAlt,
+    Parent = loadingUI.label,
+})
+
+local progressTween = TweenService:Create(loadingUI.progressFill, TweenInfo.new(1.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
     Size = UDim2.new(1, 0, 1, 0)
 })
 progressTween:Play()
 
 local spinnerConnection
 spinnerConnection = RunService.Heartbeat:Connect(function(step)
-    spinner.Rotation = (spinner.Rotation + step * 180) % 360
+    loadingUI.spinner.Rotation = (loadingUI.spinner.Rotation + step * 180) % 360
 end)
 
 local function revealMenu()
-    loadingOverlay.Active = false
-    TweenService:Create(loadingOverlay, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    loadingUI.overlay.Active = false
+    TweenService:Create(loadingUI.overlay, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         BackgroundTransparency = 1
     }):Play()
-    TweenService:Create(loadingContainer, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.container, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         BackgroundTransparency = 1
     }):Play()
-    TweenService:Create(loadingStroke, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.stroke, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         Transparency = 1
     }):Play()
-    TweenService:Create(loadingLabel, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.label, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         TextTransparency = 1
     }):Play()
-    TweenService:Create(progressOuter, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.progressOuter, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         BackgroundTransparency = 1
     }):Play()
-    TweenService:Create(progressFill, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.progressFill, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         BackgroundTransparency = 1
     }):Play()
-    TweenService:Create(progressStroke, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.progressStroke, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         Transparency = 1
     }):Play()
-    TweenService:Create(spinner, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    TweenService:Create(loadingUI.spinner, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
         ImageTransparency = 1
     }):Play()
 
@@ -3144,7 +3352,7 @@ local function revealMenu()
         if spinnerConnection then
             spinnerConnection:Disconnect()
         end
-        loadingOverlay:Destroy()
+        loadingUI.overlay:Destroy()
     end)
 
     showMenu(false)
